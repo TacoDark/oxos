@@ -6,6 +6,42 @@ use core::panic::PanicInfo;
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const WIDTH: usize = 80;
 
+#[no_mangle]
+pub extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            *s.add(i) = c as u8;
+            i += 1;
+        }
+    }
+    s
+}
+
+#[no_mangle]
+pub extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0;
+    unsafe {
+        while i < n {
+            *dest.add(i) = *src.add(i);
+            i += 1;
+        }
+    }
+    dest
+}
+
+#[no_mangle]
+pub extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    for i in 0..n {
+        let a = unsafe { *s1.add(i) };
+        let b = unsafe { *s2.add(i) };
+        if a != b {
+            return a as i32 - b as i32;
+        }
+    }
+    0
+}
+
 fn clear_screen() {
     for i in 0..(WIDTH * 25) {
         unsafe {
@@ -132,20 +168,27 @@ pub extern "C" fn _start() -> ! {
         CURRENT_DIR_IDX = 0;
     }
 
+    print_boot_logo();
+    for _ in 0..5_000_000 { unsafe { core::arch::asm!("nop"); } }
+
     clear_screen();
     print_at("OxOS Command Line", 0);
 
-    let mut row = 1;
-    let mut col = 2;
-    print_at(">", row);
+    let mut row = 7;
+    let mut col;
+    let mut prompt_len;
+    let mut path_buf = [0u8; 64];
+
+    // Print initial prompt
+    let prompt = build_path(unsafe { CURRENT_DIR_IDX }, &mut path_buf);
+    print_at(prompt, row);
+    prompt_len = prompt.len();
+    col = prompt_len;
 
     let mut last_scancode = 0u8;
     let mut cmd_buf = [0u8; 80];
     let mut cmd_len = 0;
     let mut shift = false;
-
-    // Cursor visibility control
-    let mut cursor_visible = true;
     let mut blink_counter = 0u32;
 
     loop {
@@ -153,12 +196,8 @@ pub extern "C" fn _start() -> ! {
 
         // Shift press/release handling
         match scancode {
-            0x2A | 0x36 => { // Left or Right Shift pressed
-                shift = true;
-            }
-            0xAA | 0xB6 => { // Left or Right Shift released
-                shift = false;
-            }
+            0x2A | 0x36 => { shift = true; }
+            0xAA | 0xB6 => { shift = false; }
             _ => {}
         }
 
@@ -166,19 +205,18 @@ pub extern "C" fn _start() -> ! {
         if scancode != 0 && scancode & 0x80 == 0 && scancode != last_scancode {
             match scancode {
                 0x0E => { // Backspace
-                    if col > 2 && cmd_len > 0 {
-                        col -= 1;
+                    if cmd_len > 0 {
                         cmd_len -= 1;
+                        let erase_col = prompt_len + cmd_len;
                         unsafe {
-                            *VGA_BUFFER.add((row * WIDTH + col) * 2) = b' ';
-                            *VGA_BUFFER.add((row * WIDTH + col) * 2 + 1) = 0x0f;
+                            *VGA_BUFFER.add((row * WIDTH + erase_col) * 2) = b' ';
+                            *VGA_BUFFER.add((row * WIDTH + erase_col) * 2 + 1) = 0x0f;
                         }
                     }
                 }
                 0x1C => { // Enter
                     let cmd = &cmd_buf[..cmd_len];
                     row += 1;
-                    col = 2;
 
                     if cmd.starts_with(b"echo ") {
                         let msg = &cmd[5..];
@@ -187,8 +225,11 @@ pub extern "C" fn _start() -> ! {
                     } else if cmd == b"clear" {
                         clear_screen();
                         row = 1;
-                        col = 2;
+                        let prompt = build_path(unsafe { CURRENT_DIR_IDX }, &mut path_buf);
                         print_at("OxOS Command Line", 0);
+                        print_at(prompt, row);
+                        prompt_len = prompt.len();
+                        col = prompt_len;
                     } else if cmd == b"ls" {
                         unsafe {
                             let dir = &DIR_STORAGE[CURRENT_DIR_IDX];
@@ -290,163 +331,231 @@ pub extern "C" fn _start() -> ! {
                                 }
                             }
                         }
+                    } else if cmd.starts_with(b"write ") {
+                        unsafe {
+                            let dir = &mut DIR_STORAGE[CURRENT_DIR_IDX];
+                            let rest = &cmd[6..];
+                            if let Some(space) = rest.iter().position(|&c| c == b' ') {
+                                let name = &rest[..space];
+                                let text = &rest[space+1..];
+                                if name.ends_with(b".txt") {
+                                    let name_len = name.len();
+                                    // 1. Try to find the file first
+                                    let mut file_idx = None;
+                                    for (i, f) in dir.files.iter().enumerate() {
+                                        if let Some(file) = f {
+                                            if name_eq(&file.name, name) {
+                                                file_idx = Some(i);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    // 2. If not found, create it
+                                    if file_idx.is_none() {
+                                        let mut new_file = File {
+                                            name: [0u8; MAX_NAME],
+                                            data: [0u8; MAX_DATA],
+                                            len: 0,
+                                        };
+                                        new_file.name[..name_len].copy_from_slice(name);
+                                        for (i, f) in dir.files.iter_mut().enumerate() {
+                                            if f.is_none() {
+                                                *f = Some(new_file);
+                                                file_idx = Some(i);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    // 3. Write to the file if we have an index
+                                    if let Some(i) = file_idx {
+                                        if let Some(file) = dir.files[i].as_mut() {
+                                            let write_len = text.len().min(MAX_DATA);
+                                            file.data[..write_len].copy_from_slice(&text[..write_len]);
+                                            file.len = write_len;
+                                            print_at("Wrote file", row);
+                                            row += 1;
+                                        } else {
+                                            print_at("No space for file", row);
+                                            row += 1;
+                                        }
+                                    } else {
+                                        print_at("No space for file", row);
+                                        row += 1;
+                                    }
+                                } else {
+                                    print_at("Only .txt files supported", row);
+                                    row += 1;
+                                }
+                            } else {
+                                print_at("Usage: write <file.txt> <text>", row);
+                                row += 1;
+                            }
+                        }
                     } else if cmd.starts_with(b"cat ") {
                         unsafe {
                             let dir = &DIR_STORAGE[CURRENT_DIR_IDX];
                             let name = &cmd[4..];
-                            if let Some(file) = find_file(dir, name) {
-                                let s = core::str::from_utf8(&file.data[..file.len]).unwrap_or("");
-                                print_at(s, row);
-                                row += 1;
+                            if name.ends_with(b".txt") {
+                                if let Some(file) = find_file(dir, name) {
+                                    let s = core::str::from_utf8(&file.data[..file.len]).unwrap_or("");
+                                    print_at(s, row);
+                                    row += 1;
+                                } else {
+                                    print_at("No such file", row);
+                                    row += 1;
+                                }
                             } else {
-                                print_at("No such file", row);
+                                print_at("Only .txt files supported", row);
                                 row += 1;
                             }
                         }
+                    } else if cmd == b"about" {
+                        print_at("OxOS: A hobby x86_64 OS in Rust.", row);
+                        row += 1;
+                        print_at("github.com/TacoDark/oxos", row);
+                        row += 1;
                     } else if cmd_len > 0 {
                         print_at("Unknown command", row);
                         row += 1;
                     }
 
                     cmd_len = 0;
-                    print_at(">", row);
+                    let prompt = build_path(unsafe { CURRENT_DIR_IDX }, &mut path_buf);
+                    print_at(prompt, row);
+                    prompt_len = prompt.len();
+                    col = prompt_len;
                 }
                 _ => {
                     if let Some(ascii) = scancode_to_ascii(scancode, shift) {
                         if cmd_len < cmd_buf.len() {
-                            // Store in buffer if space
                             cmd_buf[cmd_len] = ascii;
+                            let draw_col = prompt_len + cmd_len;
+                            unsafe {
+                                *VGA_BUFFER.add((row * WIDTH + draw_col) * 2) = ascii;
+                                *VGA_BUFFER.add((row * WIDTH + draw_col) * 2 + 1) = 0x0f;
+                            }
                             cmd_len += 1;
                         }
-                        // Always print, even if buffer is full
-                        unsafe {
-                            *VGA_BUFFER.add((row * WIDTH + col) * 2) = ascii;
-                            *VGA_BUFFER.add((row * WIDTH + col) * 2 + 1) = 0x0f;
-                        }
-                        col += 1;
-                        if col >= WIDTH {
-                            col = 2;
+                        if prompt_len + cmd_len >= WIDTH {
                             row += 1;
                             if row >= 25 {
                                 row = 1;
                                 clear_screen();
                                 print_at("OxOS Command Line", 0);
                             }
-                            print_at(">", row);
+                            let prompt = build_path(unsafe { CURRENT_DIR_IDX }, &mut path_buf);
+                            print_at(prompt, row);
+                            prompt_len = prompt.len();
+                            col = prompt_len;
+                            cmd_len = 0;
                         }
                     }
                 }
             }
-        }
-
-        // Update last_scancode, but reset to 0 if key is released
-        if scancode == 0 || scancode & 0x80 != 0 {
-            last_scancode = 0;
-        } else {
             last_scancode = scancode;
         }
 
-        // Erase old cursor
-        unsafe {
-            *VGA_BUFFER.add((row * WIDTH + col) * 2) = b' ';
-            *VGA_BUFFER.add((row * WIDTH + col) * 2 + 1) = 0x0f;
-        }
-
-        // Blinking logic
+        // Always update col before drawing the cursor
+        col = prompt_len + cmd_len;
+        // Cursor blinking
         blink_counter = blink_counter.wrapping_add(1);
-        if blink_counter > 200000 {
-            cursor_visible = !cursor_visible;
-            blink_counter = 0;
-        }
-
-        // Draw cursor if visible
-        if cursor_visible {
+        if blink_counter % 1_000_000 < 500_000 {
             unsafe {
                 *VGA_BUFFER.add((row * WIDTH + col) * 2) = b'_';
                 *VGA_BUFFER.add((row * WIDTH + col) * 2 + 1) = 0x0f;
             }
+        } else {
+            unsafe {
+                *VGA_BUFFER.add((row * WIDTH + col) * 2) = b' ';
+                *VGA_BUFFER.add((row * WIDTH + col) * 2 + 1) = 0x0f;
+            }
         }
+
+        unsafe { core::arch::asm!("pause"); }
     }
 }
 
 // --- Keyboard scancode to ASCII ---
 
 fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
-    match (scancode, shift) {
-        // Number row and symbols
-        (0x02, false) => Some(b'1'), (0x02, true) => Some(b'!'),
-        (0x03, false) => Some(b'2'), (0x03, true) => Some(b'@'),
-        (0x04, false) => Some(b'3'), (0x04, true) => Some(b'#'),
-        (0x05, false) => Some(b'4'), (0x05, true) => Some(b'$'),
-        (0x06, false) => Some(b'5'), (0x06, true) => Some(b'%'),
-        (0x07, false) => Some(b'6'), (0x07, true) => Some(b'^'),
-        (0x08, false) => Some(b'7'), (0x08, true) => Some(b'&'),
-        (0x09, false) => Some(b'8'), (0x09, true) => Some(b'*'),
-        (0x0A, false) => Some(b'9'), (0x0A, true) => Some(b'('),
-        (0x0B, false) => Some(b'0'), (0x0B, true) => Some(b')'),
-        (0x0C, false) => Some(b'-'), (0x0C, true) => Some(b'_'),
-        (0x0D, false) => Some(b'='), (0x0D, true) => Some(b'+'),
-        (0x1A, false) => Some(b'['), (0x1A, true) => Some(b'{'),
-        (0x1B, false) => Some(b']'), (0x1B, true) => Some(b'}'),
-        (0x2B, false) => Some(b'\\'), (0x2B, true) => Some(b'|'),
-        (0x27, false) => Some(b';'), (0x27, true) => Some(b':'),
-        (0x28, false) => Some(b'\''), (0x28, true) => Some(b'"'),
-        (0x29, false) => Some(b'`'), (0x29, true) => Some(b'~'),
-        (0x33, false) => Some(b','), (0x33, true) => Some(b'<'),
-        (0x34, false) => Some(b'.'), (0x34, true) => Some(b'>'),
-        (0x35, false) => Some(b'/'), (0x35, true) => Some(b'?'),
-        // Letters
-        (sc, false) if (0x10..=0x19).contains(&sc) => Some(b"qwertyuiop"[(sc - 0x10) as usize]),
-        (sc, true)  if (0x10..=0x19).contains(&sc) => Some(b"QWERTYUIOP"[(sc - 0x10) as usize]),
-        (sc, false) if (0x1E..=0x26).contains(&sc) => Some(b"asdfghjkl"[(sc - 0x1E) as usize]),
-        (sc, true)  if (0x1E..=0x26).contains(&sc) => Some(b"ASDFGHJKL"[(sc - 0x1E) as usize]),
-        (sc, false) if (0x2C..=0x32).contains(&sc) => Some(b"zxcvbnm"[(sc - 0x2C) as usize]),
-        (sc, true)  if (0x2C..=0x32).contains(&sc) => Some(b"ZXCVBNM"[(sc - 0x2C) as usize]),
-        // Space
-        (0x39, _) => Some(b' '),
-        _ => None,
+    // US QWERTY scancode set 1
+    let normal = [
+        0, 0, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0, 0,
+        b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', b'\n', 0,
+        b'a', b's', b'd', b'f', b'g', b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0, b'\\',
+        b'z', b'x', b'c', b'v', b'b', b'n', b'm', b',', b'.', b'/', 0, b'*', 0, b' ', 0,
+    ];
+    let shifted = [
+        0, 0, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 0, 0,
+        b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', b'\n', 0,
+        b'A', b'S', b'D', b'F', b'G', b'H', b'J', b'K', b'L', b':', b'"', b'~', 0, b'|',
+        b'Z', b'X', b'C', b'V', b'B', b'N', b'M', b'<', b'>', b'?', 0, b'*', 0, b' ', 0,
+    ];
+    let idx = scancode as usize;
+    if idx < normal.len() {
+        let c = if shift { shifted[idx] } else { normal[idx] };
+        if c != 0 { Some(c) } else { None }
+    } else {
+        None
     }
 }
 
-// --- libc stubs for linking ---
-
-#[no_mangle]
-pub extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    let mut i = 0;
-    unsafe {
-        while i < n {
-            *dest.add(i) = *src.add(i);
-            i += 1;
-        }
-    }
-    dest
-}
-
-#[no_mangle]
-pub extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
-    let mut i = 0;
-    unsafe {
-        while i < n {
-            *s.add(i) = c as u8;
-            i += 1;
-        }
-    }
-    s
-}
-
-#[no_mangle]
-pub extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
-    for i in 0..n {
-        let a = unsafe { *s1.add(i) };
-        let b = unsafe { *s2.add(i) };
-        if a != b {
-            return a as i32 - b as i32;
-        }
-    }
-    0
-}
+// --- Panic handler ---
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
+}
+
+// --- Boot logo ---
+
+fn print_boot_logo() {
+    let logo = [
+        "   ____        ____   ",
+        "  / __ \\__  _/ __ \\  ",
+        " / / / / / / / / / /  ",
+        "/ /_/ / /_/ / /_/ /   ",
+        "\\____/\\__,_/\\____/    ",
+        "      OxOS            ",
+        "",
+    ];
+    for (i, line) in logo.iter().enumerate() {
+        print_at(line, i);
+    }
+}
+
+fn build_path(mut idx: usize, buf: &mut [u8]) -> &str {
+    let mut parts = [[0u8; MAX_NAME]; 8];
+    let mut depth = 0;
+    unsafe {
+        while idx != 0 && depth < parts.len() {
+            let dir = &DIR_STORAGE[idx];
+            let name_len = dir.name.iter().position(|&c| c == 0 || c == b' ').unwrap_or(MAX_NAME);
+            parts[depth][..name_len].copy_from_slice(&dir.name[..name_len]);
+            depth += 1;
+            idx = dir.parent.unwrap_or(0);
+        }
+    }
+    let mut pos = 0;
+    buf[pos] = b'/';
+    pos += 1;
+    for i in (0..depth).rev() {
+        let name = &parts[i];
+        let name_len = name.iter().position(|&c| c == 0 || c == b' ').unwrap_or(MAX_NAME);
+        if name_len > 0 {
+            if pos + name_len < buf.len() {
+                buf[pos..pos + name_len].copy_from_slice(&name[..name_len]);
+                pos += name_len;
+                buf[pos] = b'/';
+                pos += 1;
+            }
+        }
+    }
+    if pos > 1 { pos -= 1; } // Remove trailing slash unless root
+    let prompt = b"> ";
+    if pos + prompt.len() < buf.len() {
+        buf[pos..pos + prompt.len()].copy_from_slice(prompt);
+        pos += prompt.len();
+    }
+    core::str::from_utf8(&buf[..pos]).unwrap_or("> ")
 }

@@ -48,3 +48,8 @@ MIT
 
 ---
 OxOS is a learning project. Contributions and suggestions are reccomended!
+
+## Known Issues
+
+- **Typing Bug:** There is a known issue with the command line input where typing two of the same characters in a row, as well as using space and backspace, does not work correctly. This affects normal command entry and editing.
+- Other features may be incomplete or unstable.
