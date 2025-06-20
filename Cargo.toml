@@ -1,0 +1,16 @@
+[package]
+name = "oxos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bootloader = "0.9.31"
+
+[package.metadata.bootimage]
+# No build-command needed
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

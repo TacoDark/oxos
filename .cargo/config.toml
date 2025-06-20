@@ -1,0 +1,5 @@
+[build]
+# Do NOT set target here; specify it on the command line
+
+[target.x86_64-oxos.json]
+rustflags = "-C link-arg=-Tlinker.ld"
