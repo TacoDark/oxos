@@ -25,8 +25,6 @@ fn print_at(s: &str, row: usize) {
     }
 }
 
-use core::fmt::Write;
-
 fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe {
@@ -35,8 +33,105 @@ fn inb(port: u16) -> u8 {
     value
 }
 
+// --- Filesystem structures and helpers ---
+
+const MAX_FILES: usize = 16;
+const MAX_DIRS: usize = 8;
+const MAX_NAME: usize = 16;
+const MAX_DATA: usize = 256;
+const MAX_DIR_STORAGE: usize = 32;
+
+#[derive(Clone, Copy)]
+struct File {
+    name: [u8; MAX_NAME],
+    data: [u8; MAX_DATA],
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Directory {
+    name: [u8; MAX_NAME],
+    files: [Option<File>; MAX_FILES],
+    dirs: [Option<usize>; MAX_DIRS], // indexes into DIR_STORAGE
+    parent: Option<usize>,           // index into DIR_STORAGE
+}
+
+// Pre-allocate all directories statically
+static mut DIR_STORAGE: [Directory; MAX_DIR_STORAGE] = [Directory {
+    name: [0; MAX_NAME],
+    files: [None; MAX_FILES],
+    dirs: [None; MAX_DIRS],
+    parent: None,
+}; MAX_DIR_STORAGE];
+
+static mut DIR_ALLOC_INDEX: usize = 1; // 0 is root
+
+// Root dir is always at index 0
+static mut CURRENT_DIR_IDX: usize = 0;
+
+unsafe fn alloc_dir() -> Option<usize> {
+    if DIR_ALLOC_INDEX < MAX_DIR_STORAGE {
+        let idx = DIR_ALLOC_INDEX;
+        DIR_ALLOC_INDEX += 1;
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+fn name_eq(a: &[u8], b: &[u8]) -> bool {
+    let a_end = a.iter().position(|&c| c == 0 || c == b' ').unwrap_or(a.len());
+    let b_end = b.iter().position(|&c| c == 0 || c == b' ').unwrap_or(b.len());
+    a[..a_end] == b[..b_end]
+}
+
+unsafe fn find_dir(dir: &Directory, name: &[u8]) -> Option<usize> {
+    for d in dir.dirs.iter() {
+        if let Some(idx) = d {
+            let subdir = &DIR_STORAGE[*idx];
+            if name_eq(&subdir.name, name) {
+                return Some(*idx);
+            }
+        }
+    }
+    None
+}
+
+unsafe fn find_file<'a>(dir: &'a Directory, name: &[u8]) -> Option<&'a File> {
+    for f in dir.files.iter() {
+        if let Some(file) = f {
+            if name_eq(&file.name, name) {
+                return Some(file);
+            }
+        }
+    }
+    None
+}
+
+unsafe fn find_file_mut<'a>(dir: &'a mut Directory, name: &[u8]) -> Option<&'a mut File> {
+    for f in dir.files.iter_mut() {
+        if let Some(file) = f {
+            if name_eq(&file.name, name) {
+                return Some(file);
+            }
+        }
+    }
+    None
+}
+
+// --- Main entry point ---
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    unsafe {
+        // Initialize root directory
+        DIR_STORAGE[0].name = *b"/               ";
+        DIR_STORAGE[0].files = [None; MAX_FILES];
+        DIR_STORAGE[0].dirs = [None; MAX_DIRS];
+        DIR_STORAGE[0].parent = None;
+        CURRENT_DIR_IDX = 0;
+    }
+
     clear_screen();
     print_at("OxOS Command Line", 0);
 
@@ -48,6 +143,10 @@ pub extern "C" fn _start() -> ! {
     let mut cmd_buf = [0u8; 80];
     let mut cmd_len = 0;
     let mut shift = false;
+
+    // Cursor visibility control
+    let mut cursor_visible = true;
+    let mut blink_counter = 0u32;
 
     loop {
         let scancode = inb(0x60);
@@ -90,6 +189,120 @@ pub extern "C" fn _start() -> ! {
                         row = 1;
                         col = 2;
                         print_at("OxOS Command Line", 0);
+                    } else if cmd == b"ls" {
+                        unsafe {
+                            let dir = &DIR_STORAGE[CURRENT_DIR_IDX];
+                            let mut out = [0u8; 80];
+                            let mut out_len = 0;
+                            for d in dir.dirs.iter() {
+                                if let Some(idx) = d {
+                                    let subdir = &DIR_STORAGE[*idx];
+                                    let name = &subdir.name;
+                                    let name_len = name.iter().position(|&c| c == 0 || c == b' ').unwrap_or(MAX_NAME);
+                                    if out_len + name_len + 2 < out.len() {
+                                        out[out_len] = b'[';
+                                        out_len += 1;
+                                        out[out_len..out_len + name_len].copy_from_slice(&name[..name_len]);
+                                        out_len += name_len;
+                                        out[out_len] = b']';
+                                        out_len += 1;
+                                        out[out_len] = b' ';
+                                        out_len += 1;
+                                    }
+                                }
+                            }
+                            for f in dir.files.iter() {
+                                if let Some(ref file) = f {
+                                    let name = &file.name;
+                                    let name_len = name.iter().position(|&c| c == 0 || c == b' ').unwrap_or(MAX_NAME);
+                                    if out_len + name_len + 1 < out.len() {
+                                        out[out_len..out_len + name_len].copy_from_slice(&name[..name_len]);
+                                        out_len += name_len;
+                                        out[out_len] = b' ';
+                                        out_len += 1;
+                                    }
+                                }
+                            }
+                            print_at(core::str::from_utf8(&out[..out_len]).unwrap_or(""), row);
+                            row += 1;
+                        }
+                    } else if cmd.starts_with(b"mkdir ") {
+                        unsafe {
+                            let dir = &mut DIR_STORAGE[CURRENT_DIR_IDX];
+                            let name = &cmd[6..];
+                            let name_len = name.iter().position(|&c| c == 0 || c == b' ').unwrap_or(name.len());
+                            if let Some(new_idx) = alloc_dir() {
+                                let new_dir = &mut DIR_STORAGE[new_idx];
+                                new_dir.name = [0; MAX_NAME];
+                                new_dir.files = [None; MAX_FILES];
+                                new_dir.dirs = [None; MAX_DIRS];
+                                new_dir.parent = Some(CURRENT_DIR_IDX);
+                                new_dir.name[..name_len].copy_from_slice(&name[..name_len]);
+                                for d in dir.dirs.iter_mut() {
+                                    if d.is_none() {
+                                        *d = Some(new_idx);
+                                        print_at("Directory created", row);
+                                        row += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else if cmd.starts_with(b"cd ") {
+                        unsafe {
+                            let dir = &DIR_STORAGE[CURRENT_DIR_IDX];
+                            let name = &cmd[3..];
+                            if name == b".." {
+                                if let Some(parent_idx) = dir.parent {
+                                    CURRENT_DIR_IDX = parent_idx;
+                                    print_at("Moved up", row);
+                                    row += 1;
+                                } else {
+                                    print_at("Already at root", row);
+                                    row += 1;
+                                }
+                            } else if let Some(subdir_idx) = find_dir(dir, name) {
+                                CURRENT_DIR_IDX = subdir_idx;
+                                print_at("Changed directory", row);
+                                row += 1;
+                            } else {
+                                print_at("No such directory", row);
+                                row += 1;
+                            }
+                        }
+                    } else if cmd.starts_with(b"touch ") {
+                        unsafe {
+                            let dir = &mut DIR_STORAGE[CURRENT_DIR_IDX];
+                            let name = &cmd[6..];
+                            let name_len = name.iter().position(|&c| c == 0 || c == b' ').unwrap_or(name.len());
+                            let mut new_file = File {
+                                name: [0u8; MAX_NAME],
+                                data: [0u8; MAX_DATA],
+                                len: 0,
+                            };
+                            new_file.name[..name_len].copy_from_slice(&name[..name_len]);
+                            for f in dir.files.iter_mut() {
+                                if f.is_none() {
+                                    *f = Some(new_file);
+                                    print_at("File created", row);
+                                    row += 1;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if cmd.starts_with(b"cat ") {
+                        unsafe {
+                            let dir = &DIR_STORAGE[CURRENT_DIR_IDX];
+                            let name = &cmd[4..];
+                            if let Some(file) = find_file(dir, name) {
+                                let s = core::str::from_utf8(&file.data[..file.len]).unwrap_or("");
+                                print_at(s, row);
+                                row += 1;
+                            } else {
+                                print_at("No such file", row);
+                                row += 1;
+                            }
+                        }
                     } else if cmd_len > 0 {
                         print_at("Unknown command", row);
                         row += 1;
@@ -132,10 +345,32 @@ pub extern "C" fn _start() -> ! {
         } else {
             last_scancode = scancode;
         }
+
+        // Erase old cursor
+        unsafe {
+            *VGA_BUFFER.add((row * WIDTH + col) * 2) = b' ';
+            *VGA_BUFFER.add((row * WIDTH + col) * 2 + 1) = 0x0f;
+        }
+
+        // Blinking logic
+        blink_counter = blink_counter.wrapping_add(1);
+        if blink_counter > 200000 {
+            cursor_visible = !cursor_visible;
+            blink_counter = 0;
+        }
+
+        // Draw cursor if visible
+        if cursor_visible {
+            unsafe {
+                *VGA_BUFFER.add((row * WIDTH + col) * 2) = b'_';
+                *VGA_BUFFER.add((row * WIDTH + col) * 2 + 1) = 0x0f;
+            }
+        }
     }
 }
 
-// Add this function to map scancodes to ASCII (US QWERTY, minimal)
+// --- Keyboard scancode to ASCII ---
+
 fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
     match (scancode, shift) {
         // Number row and symbols
@@ -173,7 +408,7 @@ fn scancode_to_ascii(scancode: u8, shift: bool) -> Option<u8> {
     }
 }
 
-const HEX: &[u8; 16] = b"0123456789ABCDEF";
+// --- libc stubs for linking ---
 
 #[no_mangle]
 pub extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {

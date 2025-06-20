@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bootloader = "0.9.31"
+heapless = "0.7"
 
 [package.metadata.bootimage]
 # No build-command needed
