@@ -33,6 +33,9 @@ Run in QEMU:
 qemu-system-x86_64 -drive format=raw,file=target/x86_64-oxos/debug/bootimage-oxos.bin
 ```
 
+Actual Hardware:
+🤷
+
 ## Usage
 
 - Type `echo hello` to print `hello`
